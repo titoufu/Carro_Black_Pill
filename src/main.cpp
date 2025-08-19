@@ -1,167 +1,320 @@
 #include "main.h"
-#include <cstdio> // std::snprintf
+#include "motor_config.hpp"
+#include "motor.hpp"
+#include <cstdio>
+#include <cstdlib>
+#include <cmath>
 
 extern "C"
 {
 #include "ssd1306.h"
 #include "ssd1306_fonts.h"
-  // Handles com linkage C (a lib SSD1306 é C)
-  I2C_HandleTypeDef hi2c2;
-  TIM_HandleTypeDef htim3; // ENB (PB4, TIM3_CH1)
-  TIM_HandleTypeDef htim4; // ENA (PB9, TIM4_CH4)
+#include "gy88.h"
+#include "gy88_utils.h"
 }
 
-#include "motor.hpp" // classe Motor (construtor com 8 parâmetros)
-
-// ===== Prototypes =====
+/* Prototypes */
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_I2C2_Init(void);
-static void MX_TIM3_Init(void);
-static void MX_TIM4_Init(void);
+static void MX_TIM3_Init(void); // ENB (APB1)
+static void MX_TIM4_Init(void); // ENA (APB1)
 void Error_Handler(void);
 
-// ===== PWM base 20 kHz (TIMCLK=84 MHz) =====
-#define PWM_ARR (4199U) // 84e6 / (1*(4199+1)) = 20 kHz
-
-// ===== Ponteiros globais p/ facilitar chamadas no loop =====
-static Motor *gMotorA = nullptr;
-static Motor *gMotorB = nullptr;
-
-// ===== OLED status (opcional) =====
-static void OLED_UpdateStatus(uint8_t dutyA, uint8_t dutyB, Motor::Direction dirA, Motor::Direction dirB)
+/* Handles */
+extern "C"
 {
-  static uint32_t last = 0;
-  static bool beat = false;
-  uint32_t now = HAL_GetTick();
-  if (now - last < 250)
-    return; // 4 Hz
-  last = now;
-  beat = !beat;
+  I2C_HandleTypeDef hi2c2;
+}
 
+/* IMU (uma única definição!) */
+static gy88_t gIMU;
+static bool gIMU_OK = false;
+static gy88u_cfg_t gCFG;
+// Handles dos timers (expostos pelo seu Cube)
+TIM_HandleTypeDef htim3; // ENB -> TIM3 (ex.: CH1)
+TIM_HandleTypeDef htim4; // ENA -> TIM4 (ex.: CH4)
+
+// Motores usando os macros do motor_config.hpp
+Motor motorA(MOTOR_A_TIMER_HANDLE, MOTOR_A_CHANNEL,
+             MOTOR_A_IN1_PORT, MOTOR_A_IN1_PIN,
+             MOTOR_A_IN2_PORT, MOTOR_A_IN2_PIN,
+             MOTOR_PWM_MAX, MOTOR_A_INVERT);
+
+Motor motorB(MOTOR_B_TIMER_HANDLE, MOTOR_B_CHANNEL,
+             MOTOR_B_IN1_PORT, MOTOR_B_IN1_PIN,
+             MOTOR_B_IN2_PORT, MOTOR_B_IN2_PIN,
+             MOTOR_PWM_MAX, MOTOR_B_INVERT);
+
+/* ================== TESTES NO OLED ================== */
+// ---- formata float sem %f (fixo, com sinal) ----
+static inline void fmt_signed_fp(char *buf, size_t n, float v, int decs = 2)
+{
+  char sign = (v < 0.0f) ? '-' : '+';
+  if (v < 0.0f)
+    v = -v;
+
+  int pow10 = 1;
+  for (int i = 0; i < decs; ++i)
+    pow10 *= 10;
+
+  int scaled = (int)(v * pow10 + 0.5f);
+  int whole = scaled / pow10;
+  int frac = scaled % pow10;
+
+  if (decs <= 0)
+  {
+    std::snprintf(buf, n, "%c%d", sign, whole);
+  }
+  else
+  {
+    // largura dinâmica no fractional: %0*d evita o aviso do compilador
+    std::snprintf(buf, n, "%c%d.%0*d", sign, whole, decs, frac);
+  }
+}
+
+static void OLED_Test_Accel(void)
+{
+  if (!gIMU_OK)
+    return;
+  gy88u_data_t d;
+  if (gy88u_read_and_convert(&gIMU, &gCFG, &d) != 0)
+    return;
+
+  char ln[24], v[24];
   ssd1306_Fill(Black);
   ssd1306_SetCursor(0, 0);
-  ssd1306_WriteString((char *)"BlackPill F411", Font_7x10, White);
+  ssd1306_WriteString((char *)"ACC (g)", Font_7x10, White);
+
   ssd1306_SetCursor(0, 12);
-  ssd1306_WriteString((char *)"Motors + OLED", Font_7x10, White);
+  fmt_signed_fp(v, sizeof(v), d.ax_g, 2);
+  std::snprintf(ln, sizeof(ln), "Ax:%s", v);
+  ssd1306_WriteString((char *)ln, Font_7x10, White);
 
-  char line[22];
-  ssd1306_SetCursor(0, 26);
-  std::snprintf(line, sizeof(line), "A:%s %3u%%", (dirA == Motor::Direction::Forward ? "FWD" : "REV"), dutyA);
-  ssd1306_WriteString((char *)line, Font_7x10, White);
+  ssd1306_SetCursor(0, 24);
+  fmt_signed_fp(v, sizeof(v), d.ay_g, 2);
+  std::snprintf(ln, sizeof(ln), "Ay:%s", v);
+  ssd1306_WriteString((char *)ln, Font_7x10, White);
 
-  ssd1306_SetCursor(0, 38);
-  std::snprintf(line, sizeof(line), "B:%s %3u%%", (dirB == Motor::Direction::Forward ? "FWD" : "REV"), dutyB);
-  ssd1306_WriteString((char *)line, Font_7x10, White);
+  ssd1306_SetCursor(0, 36);
+  fmt_signed_fp(v, sizeof(v), d.az_g, 2);
+  std::snprintf(ln, sizeof(ln), "Az:%s", v);
+  ssd1306_WriteString((char *)ln, Font_7x10, White);
 
-  ssd1306_SetCursor(118, 0);
-  ssd1306_WriteString((char *)(beat ? "*" : " "), Font_7x10, White);
+  ssd1306_SetCursor(0, 48);
+  float mod = std::sqrt(d.ax_g * d.ax_g + d.ay_g * d.ay_g + d.az_g * d.az_g);
+  fmt_signed_fp(v, sizeof(v), mod, 2);
+  std::snprintf(ln, sizeof(ln), "|A|:%s", v);
+  ssd1306_WriteString((char *)ln, Font_7x10, White);
 
   ssd1306_UpdateScreen();
 }
-
-// ===== Padrão de teste dos motores (não-bloqueante) =====
-// 4 fases de 5 s: 0) A/B FWD 90%, 1) A/B REV 90%, 2) A FWD & B REV 90%, 3) A REV & B FWD 90%
-static void Motors_TestPattern(void)
+static void OLED_Test_Gyro(void)
 {
-  static int phase = 0;
+  if (!gIMU_OK)
+    return;
+  gy88u_data_t d;
+  if (gy88u_read_and_convert(&gIMU, &gCFG, &d) != 0)
+    return;
+
+  char ln[24], v[24];
+  ssd1306_Fill(Black);
+  ssd1306_SetCursor(0, 0);
+  ssd1306_WriteString((char *)"GYRO (dps)", Font_7x10, White);
+
+  ssd1306_SetCursor(0, 12);
+  fmt_signed_fp(v, sizeof(v), d.gx_dps, 1);
+  std::snprintf(ln, sizeof(ln), "Gx:%s", v);
+  ssd1306_WriteString((char *)ln, Font_7x10, White);
+
+  ssd1306_SetCursor(0, 24);
+  fmt_signed_fp(v, sizeof(v), d.gy_dps, 1);
+  std::snprintf(ln, sizeof(ln), "Gy:%s", v);
+  ssd1306_WriteString((char *)ln, Font_7x10, White);
+
+  ssd1306_SetCursor(0, 36);
+  fmt_signed_fp(v, sizeof(v), d.gz_dps, 1);
+  std::snprintf(ln, sizeof(ln), "Gz:%s", v);
+  ssd1306_WriteString((char *)ln, Font_7x10, White);
+
+  ssd1306_SetCursor(0, 48);
+  fmt_signed_fp(v, sizeof(v), d.roll_deg, 1);
+  std::snprintf(ln, sizeof(ln), "r:%s ", v);
+  ssd1306_WriteString((char *)ln, Font_7x10, White);
+  fmt_signed_fp(v, sizeof(v), d.pitch_deg, 1);
+  std::snprintf(ln, sizeof(ln), "p:%s", v);
+  ssd1306_WriteString((char *)ln, Font_7x10, White);
+
+  ssd1306_UpdateScreen();
+}
+static void OLED_Test_Mag(void)
+{
+  if (!gIMU_OK)
+    return;
+  gy88u_data_t d;
+  if (gy88u_read_and_convert(&gIMU, &gCFG, &d) != 0)
+    return;
+
+  char ln[24], v[24];
+  ssd1306_Fill(Black);
+  ssd1306_SetCursor(0, 0);
+  ssd1306_WriteString((char *)"MAG (uT)", Font_7x10, White);
+
+  ssd1306_SetCursor(0, 12);
+  fmt_signed_fp(v, sizeof(v), d.mx_uT, 2);
+  std::snprintf(ln, sizeof(ln), "Mx:%s", v);
+  ssd1306_WriteString((char *)ln, Font_7x10, White);
+
+  ssd1306_SetCursor(0, 24);
+  fmt_signed_fp(v, sizeof(v), d.my_uT, 2);
+  std::snprintf(ln, sizeof(ln), "My:%s", v);
+  ssd1306_WriteString((char *)ln, Font_7x10, White);
+
+  ssd1306_SetCursor(0, 36);
+  fmt_signed_fp(v, sizeof(v), d.mz_uT, 2);
+  std::snprintf(ln, sizeof(ln), "Mz:%s", v);
+  ssd1306_WriteString((char *)ln, Font_7x10, White);
+
+  ssd1306_SetCursor(0, 48);
+  fmt_signed_fp(v, sizeof(v), d.heading_deg, 0); // inteiro
+  std::snprintf(ln, sizeof(ln), "HDG:%s", v);
+  ssd1306_WriteString((char *)ln, Font_7x10, White);
+
+  ssd1306_UpdateScreen();
+}
+static void OLED_Test_Baro(void)
+{
+  if (!gIMU_OK)
+    return;
+  gy88u_data_t d;
+  if (gy88u_read_and_convert(&gIMU, &gCFG, &d) != 0)
+    return;
+
+  char ln[24], v[24];
+  ssd1306_Fill(Black);
+  ssd1306_SetCursor(0, 0);
+  ssd1306_WriteString((char *)"BARO", Font_7x10, White);
+
+  ssd1306_SetCursor(0, 12);
+  fmt_signed_fp(v, sizeof(v), d.temperature_c, 1);
+  std::snprintf(ln, sizeof(ln), "T:%sC", v);
+  ssd1306_WriteString((char *)ln, Font_7x10, White);
+
+  ssd1306_SetCursor(0, 24);
+  int p_int = (int)(d.pressure_pa + 0.5f); // inteiro em Pa
+  std::snprintf(ln, sizeof(ln), "P:%7dPa", p_int);
+  ssd1306_WriteString((char *)ln, Font_7x10, White);
+
+  ssd1306_SetCursor(0, 36);
+  fmt_signed_fp(v, sizeof(v), d.altitude_m, 1);
+  std::snprintf(ln, sizeof(ln), "ALT:%sm", v);
+  ssd1306_WriteString((char *)ln, Font_7x10, White);
+
+  ssd1306_UpdateScreen();
+}
+static void Motors_Pattern_Update(uint8_t dutyA, uint8_t dutyB, uint32_t fase_ms)
+{
+  using Dir = Motor::Direction;
   static uint32_t t0 = 0;
-  const uint32_t PHASE_MS = 5000;
+  static uint8_t fase = 0; // 0=a, 1=b, 2=c, 3=d
 
   uint32_t now = HAL_GetTick();
-  if (now - t0 >= PHASE_MS)
+  if ((now - t0) >= fase_ms)
   {
     t0 = now;
-    phase = (phase + 1) & 3;
+    fase = (uint8_t)((fase + 1) & 0x03);
+
+    switch (fase)
+    {
+    case 0: // (a) ambos para frente
+      motorA.start(Dir::Forward, dutyA);
+      motorB.start(Dir::Forward, dutyB);
+      break;
+    case 1: // (b) ambos em ré
+      motorA.start(Dir::Backward, dutyA);
+      motorB.start(Dir::Backward, dutyB);
+      break;
+    case 2: // (c) A frente, B ré
+      motorA.start(Dir::Forward, dutyA);
+      motorB.start(Dir::Backward, dutyB);
+      break;
+    default: // (d) A ré, B frente
+      motorA.start(Dir::Backward, dutyA);
+      motorB.start(Dir::Forward, dutyB);
+      break;
+    }
   }
-
-  Motor::Direction dirA = Motor::Direction::Forward;
-  Motor::Direction dirB = Motor::Direction::Forward;
-  uint8_t dutyA = 90, dutyB = 90;
-
-  switch (phase)
-  {
-  case 0:
-    dirA = Motor::Direction::Forward;
-    dirB = Motor::Direction::Forward;
-    break;
-  case 1:
-    dirA = Motor::Direction::Backward;
-    dirB = Motor::Direction::Backward;
-    break;
-  case 2:
-    dirA = Motor::Direction::Forward;
-    dirB = Motor::Direction::Backward;
-    break;
-  default:
-    dirA = Motor::Direction::Backward;
-    dirB = Motor::Direction::Forward;
-    break;
-  }
-
-  gMotorA->start(dirA, dutyA); // setDirection + setSpeed
-  gMotorB->start(dirB, dutyB);
-
-  OLED_UpdateStatus(dutyA, dutyB, dirA, dirB); // comente se não quiser OLED agora
 }
+
+/* ================== MAIN ================== */
 
 int main(void)
 {
   HAL_Init();
   SystemClock_Config();
+  MX_GPIO_Init();
+  MX_I2C2_Init();
 
-  MX_GPIO_Init(); // PB8..PB5 como GPIO Output (IN1..IN4 em 0)
-  MX_I2C2_Init(); // PB10/PB3
-  MX_TIM3_Init(); // TIM3_CH1 @ PB4
-  MX_TIM4_Init(); // TIM4_CH4 @ PB9
+  // MOTORES
+  MX_TIM3_Init();
+  MX_TIM4_Init();
 
-  // ===== OLED Hello =====
+  HAL_TIM_PWM_Start(&htim4, MOTOR_A_CHANNEL); // ENA PB9
+  HAL_TIM_PWM_Start(&htim3, MOTOR_B_CHANNEL); // ENB PB4
+
+  motorA.begin();
+  motorB.begin();
+
+  // OLED
   ssd1306_Init();
   ssd1306_Fill(Black);
-  ssd1306_SetCursor(0, 0);
-  ssd1306_WriteString((char *)"Init...", Font_7x10, White);
   ssd1306_UpdateScreen();
+  HAL_Delay(50);
+  ssd1306_SetCursor(0, 0);
+  ssd1306_WriteString((char *)"Init OLED", Font_7x10, White);
+  ssd1306_UpdateScreen();
+  HAL_Delay(300);
 
-  // ===== Instancia os motores =====
-  // Motor A: ENA = TIM4_CH4 (PB9), IN1=PB8, IN2=PB7
-  static Motor motorA(&htim4, TIM_CHANNEL_4,
-                      GPIOB, GPIO_PIN_8,
-                      GPIOB, GPIO_PIN_7,
-                      PWM_ARR, false); // invert=false
-  // Motor B: ENB = TIM3_CH1 (PB4), IN3=PB6, IN4=PB5
-  static Motor motorB(&htim3, TIM_CHANNEL_1,
-                      GPIOB, GPIO_PIN_6,
-                      GPIOB, GPIO_PIN_5,
-                      PWM_ARR, false);
-
-  gMotorA = &motorA;
-  gMotorB = &motorB;
-
-  // Inicia PWM (CCR=0) e coloca INs conforme direção default (Forward)
-  gMotorA->begin();
-  gMotorB->begin();
-  gMotorA->coast();
-  gMotorB->coast();
+  // IMU
+  if (gy88_init(&gIMU) == 0)
+  {
+    gIMU_OK = true;
+    gy88u_default_cfg(&gCFG, gIMU.mag_type); // escalas e µT/LSB default
+    ssd1306_Fill(Black);
+    ssd1306_SetCursor(0, 0);
+    ssd1306_WriteString((char *)"GY-88 OK", Font_7x10, White);
+    const char *magtxt =
+        (gIMU.mag_type == GY88_MAG_HMC5883L) ? "MAG:HMC5883L" : (gIMU.mag_type == GY88_MAG_QMC5883L) ? "MAG:QMC5883L"
+                                                                                                     : "MAG:none";
+    ssd1306_SetCursor(0, 12);
+    ssd1306_WriteString((char *)magtxt, Font_7x10, White);
+    ssd1306_UpdateScreen();
+  }
+  else
+  {
+    ssd1306_Fill(Black);
+    ssd1306_SetCursor(0, 0);
+    ssd1306_WriteString((char *)"GY-88 FAIL", Font_7x10, White);
+    ssd1306_UpdateScreen();
+  }
 
   while (1)
   {
-    // Comente/ative o que quiser testar:
-    Motors_TestPattern(); // padrão automático (frente/ré/cruzado)
+    // Mostra uma das telas (ex.: acelerômetro); pode alternar como preferir
+    OLED_Test_Accel(); // ou OLED_Test_Gyro / OLED_Test_Mag / OLED_Test_Baro
 
-    // Exemplo de comando direto (comente o padrão acima para testar manual):
-    // gMotorA->start(Motor::Direction::Forward, 90);
-    // gMotorB->start(Motor::Direction::Forward, 90);
+    // Atualiza o padrão dos motores (ciclo a,b,c,d)
+    Motors_Pattern_Update(90, 90, 5000);
 
-    HAL_Delay(5);
+    HAL_Delay(100); // curto, mantém IMU/OLED responsivos e motor fluindo
   }
 }
 
-/* ================= Clock: HSI->PLL @84MHz ================= */
+/* ===== Clock (HSI->PLL @84 MHz) ===== */
 void SystemClock_Config(void)
 {
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
-
   __HAL_RCC_PWR_CLK_ENABLE();
   __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
 
@@ -179,22 +332,69 @@ void SystemClock_Config(void)
     Error_Handler();
   }
 
-  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK | RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.ClockType =
+      RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK | RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
   RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
   RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
-  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2; // PCLK1=42; timers APB1=84
-  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV2; // PCLK2=42
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV2;
   if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK)
   {
     Error_Handler();
   }
 }
 
-/* ================= I2C2 (PB10 SCL AF4, PB3 SDA AF9) ================= */
+/* ===== GPIO (I2C2 PB10/PB3 OD AF) ===== */
+static void MX_GPIO_Init(void)
+{
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+
+  // --- INs em saída push-pull e zerados ---
+  HAL_GPIO_WritePin(MOTOR_A_IN1_PORT, MOTOR_A_IN1_PIN, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(MOTOR_A_IN2_PORT, MOTOR_A_IN2_PIN, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(MOTOR_B_IN1_PORT, MOTOR_B_IN1_PIN, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(MOTOR_B_IN2_PORT, MOTOR_B_IN2_PIN, GPIO_PIN_RESET);
+
+  GPIO_InitTypeDef g = {0};
+  g.Pin = MOTOR_A_IN1_PIN | MOTOR_A_IN2_PIN | MOTOR_B_IN1_PIN | MOTOR_B_IN2_PIN; // PB8,7,6,5
+  g.Mode = GPIO_MODE_OUTPUT_PP;
+  g.Pull = GPIO_NOPULL;
+  g.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOB, &g); // (tudo na porta B)
+
+  // --- ENA (PB9) como AF2 -> TIM4_CH4 ---
+  g.Pin = MOTOR_A_EN_PIN; // PB9
+  g.Mode = GPIO_MODE_AF_PP;
+  g.Pull = GPIO_NOPULL;
+  g.Speed = GPIO_SPEED_FREQ_LOW;
+  g.Alternate = MOTOR_A_EN_AF; // AF2
+  HAL_GPIO_Init(MOTOR_A_EN_PORT, &g);
+
+  // --- ENB (PB4) como AF2 -> TIM3_CH1 ---
+  g.Pin = MOTOR_B_EN_PIN;      // PB4
+  g.Alternate = MOTOR_B_EN_AF; // AF2
+  HAL_GPIO_Init(MOTOR_B_EN_PORT, &g);
+
+  // --- I2C2 (PB10/PB3) como você já tinha ---
+  GPIO_InitTypeDef gi2c = {0};
+  gi2c.Mode = GPIO_MODE_AF_OD;
+  gi2c.Pull = GPIO_NOPULL; // pull-ups no módulo
+  gi2c.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+
+  gi2c.Pin = GPIO_PIN_10;
+  gi2c.Alternate = GPIO_AF4_I2C2;
+  HAL_GPIO_Init(GPIOB, &gi2c);
+  gi2c.Pin = GPIO_PIN_3;
+  gi2c.Alternate = GPIO_AF9_I2C2;
+  HAL_GPIO_Init(GPIOB, &gi2c);
+}
+
+/* ===== I2C2 (PB10/PB3) ===== */
 static void MX_I2C2_Init(void)
 {
+  __HAL_RCC_I2C2_CLK_ENABLE();
   hi2c2.Instance = I2C2;
-  hi2c2.Init.ClockSpeed = 100000; // 100kHz (pode 400kHz)
+  hi2c2.Init.ClockSpeed = 100000;
   hi2c2.Init.DutyCycle = I2C_DUTYCYCLE_2;
   hi2c2.Init.OwnAddress1 = 0;
   hi2c2.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
@@ -207,17 +407,14 @@ static void MX_I2C2_Init(void)
     Error_Handler();
   }
 }
-
-/* ================= TIM3: PWM CH1 @20kHz (ENB PB4) ================= */
+/* ===== TIM3: PWM CH1 @20 kHz (Motor B) ===== */
 static void MX_TIM3_Init(void)
 {
-  TIM_MasterConfigTypeDef sMasterConfig = {0};
-  TIM_OC_InitTypeDef sConfigOC = {0};
-
+  __HAL_RCC_TIM3_CLK_ENABLE();
   htim3.Instance = TIM3;
   htim3.Init.Prescaler = 0;
   htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim3.Init.Period = PWM_ARR;
+  htim3.Init.Period = MOTOR_PWM_MAX;
   htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
   if (HAL_TIM_PWM_Init(&htim3) != HAL_OK)
@@ -225,35 +422,25 @@ static void MX_TIM3_Init(void)
     Error_Handler();
   }
 
-  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
-  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-  if (HAL_TIMEx_MasterConfigSynchronization(&htim3, &sMasterConfig) != HAL_OK)
+  TIM_OC_InitTypeDef oc = {0};
+  oc.OCMode = TIM_OCMODE_PWM1;
+  oc.Pulse = 0;
+  oc.OCPolarity = TIM_OCPOLARITY_HIGH;
+  oc.OCFastMode = TIM_OCFAST_DISABLE;
+  if (HAL_TIM_PWM_ConfigChannel(&htim3, &oc, MOTOR_B_CHANNEL) != HAL_OK)
   {
     Error_Handler();
   }
-
-  sConfigOC.OCMode = TIM_OCMODE_PWM1;
-  sConfigOC.Pulse = 0;
-  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
-  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
-  if (HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-
-  HAL_TIM_MspPostInit(&htim3);
 }
 
-/* ================= TIM4: PWM CH4 @20kHz (ENA PB9) ================= */
+/* ===== TIM4: PWM CH4 @20 kHz (Motor A) ===== */
 static void MX_TIM4_Init(void)
 {
-  TIM_MasterConfigTypeDef sMasterConfig = {0};
-  TIM_OC_InitTypeDef sConfigOC = {0};
-
+  __HAL_RCC_TIM4_CLK_ENABLE();
   htim4.Instance = TIM4;
   htim4.Init.Prescaler = 0;
   htim4.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim4.Init.Period = PWM_ARR;
+  htim4.Init.Period = MOTOR_PWM_MAX;
   htim4.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim4.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
   if (HAL_TIM_PWM_Init(&htim4) != HAL_OK)
@@ -261,41 +448,17 @@ static void MX_TIM4_Init(void)
     Error_Handler();
   }
 
-  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
-  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-  if (HAL_TIMEx_MasterConfigSynchronization(&htim4, &sMasterConfig) != HAL_OK)
+  TIM_OC_InitTypeDef oc = {0};
+  oc.OCMode = TIM_OCMODE_PWM1;
+  oc.Pulse = 0;
+  oc.OCPolarity = TIM_OCPOLARITY_HIGH;
+  oc.OCFastMode = TIM_OCFAST_DISABLE;
+  if (HAL_TIM_PWM_ConfigChannel(&htim4, &oc, MOTOR_A_CHANNEL) != HAL_OK)
   {
     Error_Handler();
   }
-
-  sConfigOC.OCMode = TIM_OCMODE_PWM1;
-  sConfigOC.Pulse = 0;
-  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
-  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
-  if (HAL_TIM_PWM_ConfigChannel(&htim4, &sConfigOC, TIM_CHANNEL_4) != HAL_OK)
-  {
-    Error_Handler();
-  }
-
-  HAL_TIM_MspPostInit(&htim4);
 }
 
-/* ================= GPIO: IN1..IN4 (PB8..PB5) ================= */
-static void MX_GPIO_Init(void)
-{
-  __HAL_RCC_GPIOB_CLK_ENABLE();
-
-  GPIO_InitTypeDef g = {0};
-
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8 | GPIO_PIN_7 | GPIO_PIN_6 | GPIO_PIN_5, GPIO_PIN_RESET);
-  g.Pin = GPIO_PIN_8 | GPIO_PIN_7 | GPIO_PIN_6 | GPIO_PIN_5;
-  g.Mode = GPIO_MODE_OUTPUT_PP;
-  g.Pull = GPIO_NOPULL;
-  g.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOB, &g);
-}
-
-/* ================= Error handler ================= */
 void Error_Handler(void)
 {
   __disable_irq();
