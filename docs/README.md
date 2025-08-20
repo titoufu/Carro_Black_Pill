@@ -11,7 +11,7 @@ Projeto de robótica embarcada usando:
 - Classe `Motor` (C++) para **start/brake/coast** e direção com duty 0–100%
 - OLED com **UI padronizada** (telas de Accel/Gyro/Mag/Barômetro)
 - IMU com **conversões já prontas** (g, °/s, µT, heading, °C, Pa, m)
-- `main.cpp` **enxuto/orquestrador**, resto em **libs** (`lib/`)
+- `main.cpp` ** o restante em **libs** (`lib/`)
 
 ## Estrutura do projeto
 
@@ -41,7 +41,7 @@ Projeto de robótica embarcada usando:
 | I²C2 SCL    | **PB10** | AF4 |
 | I²C2 SDA    | **PB3**  | AF9 |
 
-> **L298N**: Deixe **5V_EN** **FECHADO** apenas se **NÃO** for usar 5 V do módulo para alimentar outras coisas. Motores **devem** ter fonte externa adequada. GND comum em todo o sistema.
+> **L298N**: Motores **devem** ter fonte externa adequada. GND comum em todo o sistema.
 
 ## Requisitos
 - PlatformIO (`board = blackpill_f411ce`, `framework = stm32cube`)
