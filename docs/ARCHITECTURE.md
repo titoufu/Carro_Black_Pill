@@ -7,4 +7,4 @@
 - **lib/motor/** (C++): classe `Motor` (L298N)
 - **src/main.cpp**: inicialização de HAL e orquestração de tarefas
 
-> Caso deseje separar UI do wrapper IMU, mova `status_screens.*` para `lib/UI/` e ajuste includes. A doc já cobre ambos os cenários.
+
